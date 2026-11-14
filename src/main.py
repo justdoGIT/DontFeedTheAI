@@ -21,7 +21,7 @@ from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from .anonymizer import anonymize, deanonymize
+from .anonymizer import anonymize, deanonymize, deanon_value
 from .config import config
 from . import llm_detector
 from .llm_detector import OllamaUnavailableError
@@ -29,6 +29,8 @@ from .vault import get_all_engagements, get_stats, get_transform_log, init_db
 from .verifier import start_background_verifier
 from . import timing as _timing
 from .hardware import detect_hardware, suggest_model, format_banner
+from .providers import openai_compat
+from .providers.routing import upstream_base_for_path
 
 _TZ_BRT = timezone(timedelta(hours=-3))
 
@@ -109,17 +111,23 @@ async def startup() -> None:
         log.warning(f"Hardware detection skipped: {exc}")
 
     if config.LLM_ENABLED:
-        try:
-            await llm_detector.health_check()
-            ollama_status = "OK"
-        except OllamaUnavailableError as exc:
-            log.critical("=" * 60)
-            log.critical("STARTUP FAILED — Ollama is unreachable or missing model.")
-            log.critical(f"  {exc}")
-            log.critical("The proxy will NOT start without a working LLM layer.")
-            log.critical("Start Ollama and pull the model, then restart the proxy.")
-            log.critical("=" * 60)
-            raise SystemExit(1)
+        for attempt in range(1, 4):
+            try:
+                await llm_detector.health_check()
+                ollama_status = "OK"
+                break
+            except OllamaUnavailableError as exc:
+                if attempt < 3:
+                    log.warning(f"Ollama not ready (attempt {attempt}/3), retrying in 5s… {exc}")
+                    import asyncio
+                    await asyncio.sleep(5)
+                else:
+                    log.warning("=" * 60)
+                    log.warning("Ollama unreachable at startup — running regex-only mode.")
+                    log.warning(f"  {exc}")
+                    log.warning("LLM detection disabled until Ollama becomes available.")
+                    log.warning("=" * 60)
+                    ollama_status = "unreachable (regex-only)"
     else:
         ollama_status = "disabled (LLM_ENABLED=false)"
 
@@ -594,16 +602,6 @@ async def _anon_request(body: dict) -> dict:
     return body
 
 
-def _deanon_value(obj):
-    if isinstance(obj, str):
-        return deanonymize(obj)
-    if isinstance(obj, dict):
-        return {k: _deanon_value(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_deanon_value(i) for i in obj]
-    return obj
-
-
 def _deanon_response(data: dict) -> dict:
     """Deanonymize all text and tool_use inputs in an Anthropic response."""
     for block in data.get("content", []):
@@ -612,7 +610,7 @@ def _deanon_response(data: dict) -> dict:
             block["text"] = deanonymize(block.get("text", ""))
         elif t == "tool_use":
             # Deanonymize tool inputs so Claude Code executes commands with real values
-            block["input"] = _deanon_value(block.get("input", {}))
+            block["input"] = deanon_value(block.get("input", {}))
     return data
 
 
@@ -705,6 +703,39 @@ async def last_activity() -> dict:
     }
 
 
+def _filter_forward_headers(request: Request) -> dict[str, str]:
+    return {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in ("host", "content-length", "transfer-encoding")
+    }
+
+
+def _ollama_unavailable_response(*, openai_shape: bool) -> Response:
+    message = (
+        "LLM anonymization layer (Ollama) is unreachable. "
+        "Request blocked to prevent unredacted data from reaching the upstream API. "
+        "Start Ollama and ensure the model is loaded, then retry."
+    )
+    if openai_shape:
+        payload = {
+            "error": {
+                "message": message,
+                "type": "anonymizer_unavailable",
+                "code": "anonymizer_unavailable",
+            }
+        }
+    else:
+        payload = {
+            "type": "error",
+            "error": {"type": "anonymizer_unavailable", "message": message},
+        }
+    return Response(
+        content=json.dumps(payload),
+        status_code=503,
+        media_type="application/json",
+    )
+
+
 @app.post("/v1/messages")
 async def proxy_messages(request: Request) -> Response:
     global _last_request_at
@@ -713,10 +744,7 @@ async def proxy_messages(request: Request) -> Response:
     _timing.reset()
 
     body = await request.json()
-    headers = {
-        k: v for k, v in request.headers.items()
-        if k.lower() not in ("host", "content-length", "transfer-encoding")
-    }
+    headers = _filter_forward_headers(request)
 
     want_stream = body.get("stream", False)
     model = body.get("model", "?")
@@ -729,21 +757,7 @@ async def proxy_messages(request: Request) -> Response:
         body = await _anon_request(body)
     except OllamaUnavailableError as exc:
         log.error(f"Ollama unavailable during anonymization — blocking request: {exc}")
-        return Response(
-            content=json.dumps({
-                "type": "error",
-                "error": {
-                    "type": "anonymizer_unavailable",
-                    "message": (
-                        "LLM anonymization layer (Ollama) is unreachable. "
-                        "Request blocked to prevent unredacted data from reaching Claude. "
-                        "Start Ollama and ensure the model is loaded, then retry."
-                    ),
-                },
-            }),
-            status_code=503,
-            media_type="application/json",
-        )
+        return _ollama_unavailable_response(openai_shape=False)
     anon_ms = (time.perf_counter() - t_anon_start) * 1000
 
     # Snapshot LLM + regex breakdown accumulated inside anonymize()
@@ -809,19 +823,87 @@ async def proxy_messages(request: Request) -> Response:
     )
 
 
+@app.post("/v1/chat/completions")
+async def proxy_chat_completions(request: Request) -> Response:
+    """OpenAI-compatible chat completions (OpenAI, OpenRouter, local gateways)."""
+    global _last_request_at
+    _last_request_at = datetime.now(timezone.utc)
+    req_start = time.perf_counter()
+    _timing.reset()
+
+    body = await request.json()
+    headers = _filter_forward_headers(request)
+
+    want_stream = body.get("stream", False)
+    model = body.get("model", "?")
+    n_msgs = len(body.get("messages", []))
+    log.info(f"→ [openai] model={model}  msgs={n_msgs}  stream={want_stream}")
+
+    t_anon_start = time.perf_counter()
+    try:
+        body = await openai_compat.anonymize_chat_request(body)
+    except OllamaUnavailableError as exc:
+        log.error(f"Ollama unavailable during anonymization — blocking request: {exc}")
+        return _ollama_unavailable_response(openai_shape=True)
+    anon_ms = (time.perf_counter() - t_anon_start) * 1000
+    anon_snap = _timing.snapshot()
+
+    body["stream"] = False
+
+    upstream = config.OPENAI_API_URL.rstrip("/")
+    t_api_start = time.perf_counter()
+    async with httpx.AsyncClient(timeout=600) as client:
+        resp = await client.post(
+            f"{upstream}/v1/chat/completions",
+            json=body,
+            headers=headers,
+        )
+    api_ms = (time.perf_counter() - t_api_start) * 1000
+
+    if resp.status_code != 200:
+        log.warning(f"← [openai] {resp.status_code}: {resp.text[:200]}")
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            media_type="application/json",
+        )
+
+    t_deanon_start = time.perf_counter()
+    data = resp.json()
+    data = openai_compat.deanonymize_chat_response(data)
+    deanon_ms = (time.perf_counter() - t_deanon_start) * 1000
+
+    total_ms = (time.perf_counter() - req_start) * 1000
+    log.info(
+        f"← [openai] ok  total={total_ms:.0f}ms"
+        f"  anon={anon_ms:.0f}ms (llm={anon_snap['llm_ms']:.0f} regex={anon_snap['regex_ms']:.0f})"
+        f"  api={api_ms:.0f}ms  deanon={deanon_ms:.0f}ms"
+    )
+
+    if want_stream:
+        return StreamingResponse(
+            openai_compat.emit_chat_completion_sse(data),
+            media_type="text/event-stream",
+        )
+
+    return Response(
+        content=json.dumps(data),
+        status_code=200,
+        media_type="application/json",
+    )
+
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 async def proxy_catchall(request: Request, path: str) -> Response:
-    """Transparent pass-through for all other Anthropic API endpoints (/v1/models, etc.)"""
-    headers = {
-        k: v for k, v in request.headers.items()
-        if k.lower() not in ("host", "content-length", "transfer-encoding")
-    }
+    """Pass-through for other upstream endpoints (/v1/models, embeddings, …)."""
+    headers = _filter_forward_headers(request)
     body = await request.body()
+    upstream = upstream_base_for_path(path)
 
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.request(
             method=request.method,
-            url=f"{config.ANTHROPIC_API_URL}/{path}",
+            url=f"{upstream}/{path}",
             headers=headers,
             content=body,
             params=dict(request.query_params),
